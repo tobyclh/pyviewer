@@ -14,10 +14,10 @@ from .easy_dict import EasyDict
 # Helper class for UIs with toolbar on the left and output image on the right
 
 class ToolbarViewer:
-    def __init__(self, name, pad_bottom=0, hidden=False, batch_mode=False):
+    def __init__(self, name, pad_bottom=0, hidden=False, batch_mode=False, use_cuda=True):
         self.output_key = ''.join(random.choices(string.ascii_letters, k=20))
         self.pad_bottom = pad_bottom
-        self.v = gl_viewer.viewer(name, hidden=hidden or batch_mode, swap_interval=1)
+        self.v = gl_viewer.viewer(name, hidden=hidden or batch_mode, swap_interval=1, use_cuda=use_cuda)
         self.menu_bar_height = 0
         self.toolbar_width = 300
         self.img_shape = [3, 4, 4]

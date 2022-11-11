@@ -25,7 +25,8 @@ class WindowSize(ctypes.Structure):
     _fields_ = [('w', ctypes.c_uint), ('h', ctypes.c_uint)]
 
 class SingleImageViewer:
-    def __init__(self, title, key=None, dtype='uint8', vsync=True, hidden=False):
+    def __init__(self, title, key=None, dtype='uint8', vsync=True, hidden=False, use_cuda=True):
+        self.use_cuda = use_cuda
         self.title = title
         self.key = key or ''.join(random.choices(string.ascii_letters, k=100))
         self.ui_process = None
@@ -109,11 +110,14 @@ class SingleImageViewer:
         self.ui_process.join()
 
     def process_func(self):
-        v = viewer(self.title, swap_interval=int(self.vsync), hidden=self.hidden.value)
-        v._window_hidden = self.hidden.value
-        v.set_interp_nearest()
-        compute_thread = Thread(target=self.compute, args=[v])
-        v.start(self.ui, [compute_thread], self.set_glfw_callbacks)
+        # print('process_func, start viewer')
+        self.v = viewer(self.title, swap_interval=int(self.vsync), hidden=self.hidden.value, use_cuda=self.use_cuda)
+        self.v._window_hidden = self.hidden.value
+        self.v.set_interp_nearest()
+        # print('got viewer')
+        compute_thread = Thread(target=self.compute, args=[self.v])
+        # print('compute_thread')
+        self.v.start(self.ui, [compute_thread], self.set_glfw_callbacks)
 
     def set_glfw_callbacks(self, window):
         self.window_size_callback(window, *glfw.get_window_size(window)) # set defaults
@@ -226,6 +230,7 @@ inst: SingleImageViewer = None
 
 def init(*args, **kwargs):
     global inst
+
     if inst is None:
         inst = SingleImageViewer(*args, **kwargs)
 

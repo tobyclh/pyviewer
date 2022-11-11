@@ -12,7 +12,7 @@ from sys import platform
 from contextlib import contextmanager, nullcontext
 
 import imgui.core
-import imgui.plot as implot
+# import imgui.plot as implot
 from imgui.integrations.glfw import GlfwRenderer
 from .imgui_themes import theme_dark_overshifted, theme_deep_dark, theme_ps, theme_contrast
 from .utils import normalize_image_data
@@ -47,7 +47,8 @@ class _texture:
         for params in ((gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT), (gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT), (gl.GL_TEXTURE_MIN_FILTER, min_mag_filter), (gl.GL_TEXTURE_MAG_FILTER, min_mag_filter)):
             gl.glTexParameteri(gl.GL_TEXTURE_2D, *params)
         self.mapper = None
-        self.shape = [0,0]
+        self.shape = [0,0] # texture
+        self._cuda_buffer = None
 
     # be sure to del textures if you create a forget them often (python doesn't necessarily call del on garbage collect)
     def __del__(self):
@@ -61,68 +62,73 @@ class _texture:
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
     def upload_np(self, image):
-        image = normalize_image_data(image, 'float32')
+        image = normalize_image_data(image, 'uint8')
 
         # support for shapes (h,w), (h,w,1), (h,w,3) and (h,w,4)
         if len(image.shape) == 2:
             image = np.expand_dims(image, -1)
         if image.shape[2] == 1:
             image = np.repeat(image, 3, axis=-1) #image.repeat(1,1,3)
-        if image.shape[2] == 3:
-            image = np.concatenate([image, np.ones_like(image[:,:,0:1])], axis=-1)
+        # if image.shape[2] == 3:
+        #     image = np.concatenate([image, np.ones_like(image[:,:,0:1])*255], axis=-1)
 
         shape = image.shape
         
         gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
         if shape[0] != self.shape[0] or shape[1] != self.shape[1]:
             # Reallocate
             self.shape = shape
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, shape[1], shape[0], 0, gl.GL_RGBA, gl.GL_FLOAT, image)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, shape[1], shape[0], 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, image)
         else:
             # Overwrite
-            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, shape[1], shape[0], gl.GL_RGBA, gl.GL_FLOAT, image)
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, shape[1], shape[0], gl.GL_RGB, gl.GL_UNSIGNED_BYTE, image)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
+    @torch.no_grad()
     def upload_torch(self, img):
         assert img.device.type == "cuda", "Please provide a CUDA tensor"
         assert img.ndim == 3, "Please provide a HWC tensor"
         assert img.shape[2] < min(img.shape[0], img.shape[1]), "Please provide a HWC tensor"
 
-        if not img.dtype.is_floating_point:
-            img = img.to(torch.float32) / 255.0
-
-        # support for shapes (h,w), (h,w,1), (h,w,3) and (h,w,4)
+        if img.dtype.is_floating_point:
+            img = img.byte()
+            
         if img.shape[2] == 1:
             img = img.repeat(1,1,3)
         if img.shape[2] == 3:
-            img = torch.cat((img, torch.ones_like(img[:,:,0:1])), 2)
-        
-        img = img.contiguous()
+            if (self._cuda_buffer is None) or (img.shape[0] != self._cuda_buffer.shape[0] or img.shape[1] != self._cuda_buffer.shape[1]):
+                self._cuda_buffer = torch.ones((img.shape[0], img.shape[1], 4), dtype=torch.uint8, device=img.device) * 255
+                self._cuda_buffer.requires_grad = False
+            self._cuda_buffer[..., :-1] = img
+        elif img.shape[2] == 4:
+            self._cuda_buffer[:] = img
+
+        # img = img.contiguous()
         if has_pycuda:
-            self.upload_ptr(img.data_ptr(), img.shape)
+            self.upload_ptr(self._cuda_buffer.data_ptr(), self._cuda_buffer.shape)
         else:
-            self.upload_np(img.detach().cpu().numpy())
+            self.upload_np(self._cuda_buffer.detach().cpu().numpy())
 
     # Copy from cuda pointer
     def upload_ptr(self, ptr, shape):
         assert has_pycuda, 'PyCUDA-GL not available, cannot upload using raw pointer'
-        assert shape[-1] == 4, 'Data format not RGBA'
-
+        # assert shape[-1] == 3, 'Data format not RGB'
+        
         # reallocate if shape changed or data type changed from np to torch
+        
         if shape[0] != self.shape[0] or shape[1] != self.shape[1] or self.mapper is None:
             self.shape = shape
             if self.mapper is not None:
                 self.mapper.unregister()
+
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, shape[1], shape[0], 0, gl.GL_RGBA, gl.GL_FLOAT, None)
+            gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, shape[1], shape[0], 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
             gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
             self.mapper = cuda_gl.RegisteredImage(int(self.tex), gl.GL_TEXTURE_2D, pycuda.gl.graphics_map_flags.WRITE_DISCARD)
-        
-        # map texture to cuda ptr
         tex_data = self.mapper.map()
         tex_arr = tex_data.array(0, 0)
-
-        # Cast to python integer type
         ptr_int = int(ptr)
         assert ptr_int == ptr, 'Device pointer overflow'
 
@@ -130,13 +136,16 @@ class _texture:
         cpy = pycuda.driver.Memcpy2D()
         cpy.set_src_device(ptr_int)
         cpy.set_dst_array(tex_arr)
-        cpy.width_in_bytes = cpy.src_pitch = cpy.dst_pitch = 4*shape[1]*shape[2]
+        cpy.width_in_bytes = cpy.src_pitch = cpy.dst_pitch = 1*shape[1]*shape[2]
+        # cpy.dst_pitch = int(cpy.dst_pitch / 2 * 4)
         cpy.height = shape[0]
         cpy(aligned=False)
 
         # cleanup
         tex_data.unmap()
         cuda_synchronize()
+        # gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
 
 class _editable:
     def __init__(self, name, ui_code = '', run_code = ''):
@@ -179,13 +188,14 @@ class _editable:
 
 
 class viewer:
-    def __init__(self, title, inifile=None, swap_interval=0, hidden=False):
+    def __init__(self, title, inifile=None, swap_interval=0, hidden=False, use_cuda=True):
         self.quit = False
-
+        self.use_cuda = use_cuda
         self._images = {}
         self._editables = {}
         self.tex_interp_mode = gl.GL_LINEAR
-        self.default_font_size = 15
+        self.default_font_size = 36
+        self._cuda_context = None
         
         fname = inifile or "".join(c for c in title.lower() if c.isalnum())
         self._inifile = Path(fname).with_suffix('.ini')
@@ -236,19 +246,32 @@ class viewer:
             raise RuntimeError('Could not create window')
 
         glfw.set_window_pos(self._window, *self.window_pos)
+        
         glfw.make_context_current(self._window)
         print('GL context:', gl.glGetString(gl.GL_VERSION).decode('utf8'))
-
-        self._cuda_context = None
-        if has_pycuda:
-            pycuda.driver.init()
-            self._cuda_context = pycuda.gl.make_context(pycuda.driver.Device(0))
+        
+        if has_pycuda and use_cuda:
+            # print(f'_cuda_context: {cuda_context}')
+            try:
+                import pycuda.gl.autoinit
+            except:
+                print('Failed to autoinit')
+                pass
+            
+            try:
+                import pycuda.gl.autoinit
+                self._cuda_context = pycuda.gl.make_context(pycuda.driver.Device(0))
+            except:
+                print('Failed to make context')
+                pass
+                        
+            # print(f'_cuda_context: {self._cuda_context}')
         glfw.swap_interval(swap_interval) # should increase on high refresh rate monitors
         glfw.make_context_current(None)
 
         self._imgui_context = imgui.create_context()
-        self._implot_context = implot.create_context()
-        implot.set_imgui_context(self._imgui_context)
+        # self._implot_context = implot.create_context()
+        # implot.set_imgui_context(self._imgui_context)
         #implot.get_style().anti_aliased_lines = True # turn global AA on
 
         font = self.get_default_font()
@@ -269,11 +292,11 @@ class viewer:
         return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
     
     def push_context(self):
-        if has_pycuda:
+        if has_pycuda and self.use_cuda:
             self._cuda_context.push()
     
     def pop_context(self):
-        if has_pycuda:
+        if has_pycuda and self.use_cuda:
             self._cuda_context.pop()
 
     @contextmanager
@@ -409,6 +432,7 @@ class viewer:
 
     def start(self, loopfunc, workers = (), glfw_init_callback = None):
         # allow single thread object
+        print('Viewer start')
         if not hasattr(workers, '__len__'):
             workers = (workers,)
 
@@ -510,10 +534,11 @@ class viewer:
 
         glfw.destroy_window(self._window)
         self.pop_context()
-
+    
+    @torch.no_grad()
     def upload_image(self, name, data):
         if torch.is_tensor(data):
-            if data.device.type in ['mps', 'cpu']:
+            if data.device.type in ['mps', 'cpu'] or not self.use_cuda:
                 # would require gl-metal interop or metal UI backend
                 return self.upload_image_np(name, data.cpu().numpy())
             else:
@@ -522,6 +547,7 @@ class viewer:
             return self.upload_image_np(name, data)
 
     # Upload image from PyTorch tensor
+    @torch.no_grad()
     def upload_image_torch(self, name, tensor):
         assert isinstance(tensor, torch.Tensor)
         with self.lock(strict=False) as l:
@@ -553,7 +579,7 @@ class viewer:
         with self.lock(strict=False) as l:
             if l == nullcontext: # isinstance doesn't work
                 return
-            cuda_synchronize()
+            # cuda_synchronize()
             if not self.quit:
                 self.push_context() # set the context for whichever thread wants to upload
                 if name not in self._images:
