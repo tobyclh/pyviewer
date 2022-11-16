@@ -92,8 +92,10 @@ class _texture:
         assert img.shape[2] < min(img.shape[0], img.shape[1]), "Please provide a HWC tensor"
 
         if img.dtype.is_floating_point:
-            img = img.byte()
-            
+            if img.max() <= 1.0:
+                img *= 255
+            img = (img).byte()
+
         if img.shape[2] == 1:
             img = img.repeat(1,1,3)
         if img.shape[2] == 3:
@@ -102,13 +104,20 @@ class _texture:
                 self._cuda_buffer.requires_grad = False
             self._cuda_buffer[..., :-1] = img
         elif img.shape[2] == 4:
-            self._cuda_buffer[:] = img
+            if (self._cuda_buffer is not None) and (img.shape == self._cuda_buffer.shape):
+                self._cuda_buffer[:] = img
+            else:
+                self._cuda_buffer = img
 
         # img = img.contiguous()
         if has_pycuda:
             self.upload_ptr(self._cuda_buffer.data_ptr(), self._cuda_buffer.shape)
         else:
             self.upload_np(self._cuda_buffer.detach().cpu().numpy())
+        # if has_pycuda:
+        #     self.upload_ptr(img.data_ptr(), img.shape)
+        # else:
+        #     self.upload_np(img.detach().cpu().numpy())
 
     # Copy from cuda pointer
     def upload_ptr(self, ptr, shape):
@@ -124,7 +133,7 @@ class _texture:
 
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
             gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, shape[1], shape[0], 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, None)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA , shape[1], shape[0], 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None)
             gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
             self.mapper = cuda_gl.RegisteredImage(int(self.tex), gl.GL_TEXTURE_2D, pycuda.gl.graphics_map_flags.WRITE_DISCARD)
         tex_data = self.mapper.map()
@@ -137,7 +146,8 @@ class _texture:
         cpy.set_src_device(ptr_int)
         cpy.set_dst_array(tex_arr)
         cpy.width_in_bytes = cpy.src_pitch = cpy.dst_pitch = 1*shape[1]*shape[2]
-        # cpy.dst_pitch = int(cpy.dst_pitch / 2 * 4)
+        # cpy.dst_pitch = int(cpy.dst_pitch / 3 * 4)
+        # cpy.src_pitch = int(cpy.src_pitch / 3 * 4)
         cpy.height = shape[0]
         cpy(aligned=False)
 
@@ -490,7 +500,6 @@ class viewer:
                     self._editables[key].loop(self)
 
                 imgui.pop_font()
-
                 imgui.render()
                 
                 gl.glClearColor(0, 0, 0, 1)
